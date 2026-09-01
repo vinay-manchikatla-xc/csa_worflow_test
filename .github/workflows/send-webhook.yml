@@ -11,42 +11,138 @@ jobs:
   sync-documentation:
     runs-on: ubuntu-latest
 
+    permissions:
+      contents: read
+
     steps:
+      - name: Collect documentation changes
+        id: changes
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPOSITORY: ${{ github.repository }}
+          BEFORE: ${{ github.event.before }}
+          AFTER: ${{ github.event.after }}
+        run: |
+          set -euo pipefail
+
+          echo "Repository: $REPOSITORY"
+          echo "Before: $BEFORE"
+          echo "After: $AFTER"
+
+          echo "Getting changed files..."
+
+          # Get the files changed between the previous commit
+          # and the current commit.
+          #
+          # GitHub returns files with statuses such as:
+          # A = added
+          # M = modified
+          # D = removed
+          # R = renamed
+          FILES=$(gh api \
+            "repos/${REPOSITORY}/compare/${BEFORE}...${AFTER}" \
+            --paginate \
+            --jq '.files[] | [.status, .filename, (.previous_filename // "")] | @tsv')
+
+          echo "Changed files:"
+          echo "$FILES"
+
+          ADDED='[]'
+          MODIFIED='[]'
+          REMOVED='[]'
+
+          while IFS=$'\t' read -r STATUS FILE PREVIOUS_FILE; do
+
+            # Ignore empty lines
+            if [[ -z "$FILE" ]]; then
+              continue
+            fi
+
+            # Only documentation files should be synchronized.
+            if [[ "$FILE" != documentation/* && "$PREVIOUS_FILE" != documentation/* ]]; then
+              continue
+            fi
+
+            case "$STATUS" in
+
+              A)
+                ADDED=$(jq \
+                  --arg file "$FILE" \
+                  '. + [$file]' \
+                  <<< "$ADDED")
+                ;;
+
+              M)
+                MODIFIED=$(jq \
+                  --arg file "$FILE" \
+                  '. + [$file]' \
+                  <<< "$MODIFIED")
+                ;;
+
+              D)
+                REMOVED=$(jq \
+                  --arg file "$FILE" \
+                  '. + [$file]' \
+                  <<< "$REMOVED")
+                ;;
+
+              R)
+                # For a rename:
+                #
+                # old documentation file -> removed
+                # new documentation file -> added
+                #
+                if [[ "$PREVIOUS_FILE" == documentation/* ]]; then
+                  REMOVED=$(jq \
+                    --arg file "$PREVIOUS_FILE" \
+                    '. + [$file]' \
+                    <<< "$REMOVED")
+                fi
+
+                if [[ "$FILE" == documentation/* ]]; then
+                  ADDED=$(jq \
+                    --arg file "$FILE" \
+                    '. + [$file]' \
+                    <<< "$ADDED")
+                fi
+                ;;
+
+              *)
+                echo "Ignoring unsupported status: $STATUS $FILE"
+                ;;
+
+            esac
+
+          done <<< "$FILES"
+
+          COMMITS=$(jq -cn \
+            --argjson added "$ADDED" \
+            --argjson modified "$MODIFIED" \
+            --argjson removed "$REMOVED" \
+            '[
+              {
+                added: $added,
+                modified: $modified,
+                removed: $removed
+              }
+            ]')
+
+          echo "Final changes:"
+          echo "$COMMITS" | jq .
+
+          echo "commits=$COMMITS" >> "$GITHUB_OUTPUT"
+
       - name: Send documentation changes to Customer Support Assistant
         env:
           WEBHOOK_URL: ${{ secrets.WEBHOOK_URL }}
           WEBHOOK_SECRET: ${{ secrets.WEBHOOK_SECRET }}
-          GITHUB_EVENT_PATH: ${{ github.event_path }}
+          REPOSITORY: ${{ github.repository }}
+          REF: ${{ github.ref }}
+          AFTER: ${{ github.event.after }}
+          COMMITS: ${{ steps.changes.outputs.commits }}
         run: |
           set -euo pipefail
 
-          echo "Processing GitHub push event..."
-
-          # Read the original GitHub push event.
-          EVENT=$(cat "$GITHUB_EVENT_PATH")
-
-          # Extract repository information.
-          REF=$(echo "$EVENT" | jq -r '.ref')
-          AFTER=$(echo "$EVENT" | jq -r '.after')
-          REPOSITORY=$(echo "$EVENT" | jq -r '.repository.full_name')
-
-          echo "Repository: $REPOSITORY"
-          echo "Ref: $REF"
-          echo "Commit: $AFTER"
-
-          # Extract all commits from this push.
-          #
-          # Only send the fields required by the backend DTO.
-          COMMITS=$(echo "$EVENT" | jq -c '[
-            .commits[] |
-            {
-              added: (.added // []),
-              modified: (.modified // []),
-              removed: (.removed // [])
-            }
-          ]')
-
-          # Build the webhook payload.
           PAYLOAD=$(jq -cn \
             --arg ref "$REF" \
             --arg after "$AFTER" \
@@ -61,20 +157,23 @@ jobs:
               commits: $commits
             }')
 
-          echo "Webhook payload:"
+          echo "========================================"
+          echo "Webhook Payload"
+          echo "========================================"
+
           echo "$PAYLOAD" | jq .
 
-          # Generate HMAC-SHA256 signature.
-          #
-          # The signature is generated from the exact payload
-          # that will be sent to the backend.
+          echo "========================================"
+          echo "Generating HMAC signature"
+          echo "========================================"
+
           SIGNATURE=$(
             printf '%s' "$PAYLOAD" |
             openssl dgst -sha256 -hmac "$WEBHOOK_SECRET" |
             awk '{print "sha256=" $2}'
           )
 
-          echo "Sending webhook..."
+          echo "Signature generated successfully."
 
           RESPONSE_FILE=$(mktemp)
 
@@ -97,7 +196,6 @@ jobs:
           echo "Webhook response:"
           cat "$RESPONSE_FILE"
 
-          # Fail the workflow for any non-2xx response.
           if [[ "$HTTP_STATUS" -lt 200 || "$HTTP_STATUS" -ge 300 ]]; then
             echo "Webhook request failed."
             exit 1
