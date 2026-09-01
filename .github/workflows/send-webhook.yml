@@ -79,19 +79,19 @@ jobs:
 
               R*)
                 # Rename:
-                # EXTRA = old path
-                # FILE  = new path
+                # FILE  = old path
+                # EXTRA = new path
                 #
                 # Treat it as delete + add.
-                if [ -n "${EXTRA:-}" ]; then
+                if [ -n "${FILE:-}" ]; then
                   REMOVED=$(jq \
-                    --arg file "$EXTRA" \
+                    --arg file "$FILE" \
                     '. + [$file]' \
                     <<< "$REMOVED")
                 fi
 
                 ADDED=$(jq \
-                  --arg file "$FILE" \
+                  --arg file "$EXTRA" \
                   '. + [$file]' \
                   <<< "$ADDED")
                 ;;
