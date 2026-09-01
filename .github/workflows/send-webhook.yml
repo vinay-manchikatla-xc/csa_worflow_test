@@ -1,4 +1,4 @@
-name: Send Webhook to Customer Support Assistant
+name: Sync Documentation to Vector DB
 
 on:
   push:
@@ -8,47 +8,99 @@ on:
       - 'documentation/**'
 
 jobs:
-  send-webhook:
+  sync-documentation:
     runs-on: ubuntu-latest
+
     steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
-
-      - name: Send webhook to Customer Support Assistant
+      - name: Send documentation changes to Customer Support Assistant
+        env:
+          WEBHOOK_URL: ${{ secrets.WEBHOOK_URL }}
+          WEBHOOK_SECRET: ${{ secrets.WEBHOOK_SECRET }}
+          GITHUB_EVENT_PATH: ${{ github.event_path }}
         run: |
-          # Get file changes from head_commit (has added/modified/removed arrays)
-          ADDED=$(echo '${{ toJson(github.event.head_commit.added) }}' | jq -r '. // []')
-          MODIFIED=$(echo '${{ toJson(github.event.head_commit.modified) }}' | jq -r '. // []')
-          REMOVED=$(echo '${{ toJson(github.event.head_commit.removed) }}' | jq -r '. // []')
+          set -euo pipefail
 
-          # Build the webhook payload
-          PAYLOAD=$(jq -n \
-            --arg ref "${{ github.ref }}" \
-            --arg repo "${{ github.repository }}" \
-            --argjson added "$ADDED" \
-            --argjson modified "$MODIFIED" \
-            --argjson removed "$REMOVED" \
+          echo "Processing GitHub push event..."
+
+          # Read the original GitHub push event.
+          EVENT=$(cat "$GITHUB_EVENT_PATH")
+
+          # Extract repository information.
+          REF=$(echo "$EVENT" | jq -r '.ref')
+          AFTER=$(echo "$EVENT" | jq -r '.after')
+          REPOSITORY=$(echo "$EVENT" | jq -r '.repository.full_name')
+
+          echo "Repository: $REPOSITORY"
+          echo "Ref: $REF"
+          echo "Commit: $AFTER"
+
+          # Extract all commits from this push.
+          #
+          # Only send the fields required by the backend DTO.
+          COMMITS=$(echo "$EVENT" | jq -c '[
+            .commits[] |
+            {
+              added: (.added // []),
+              modified: (.modified // []),
+              removed: (.removed // [])
+            }
+          ]')
+
+          # Build the webhook payload.
+          PAYLOAD=$(jq -cn \
+            --arg ref "$REF" \
+            --arg after "$AFTER" \
+            --arg repository "$REPOSITORY" \
+            --argjson commits "$COMMITS" \
             '{
               ref: $ref,
-              repository: { full_name: $repo },
-              commits: [{
-                added: $added,
-                modified: $modified,
-                removed: $removed
-              }]
+              after: $after,
+              repository: {
+                full_name: $repository
+              },
+              commits: $commits
             }')
 
-          echo "Payload: $PAYLOAD"
+          echo "Webhook payload:"
+          echo "$PAYLOAD" | jq .
 
-          # Generate HMAC-SHA256 signature
-          SECRET="${{ secrets.WEBHOOK_SECRET }}"
-          SIGNATURE=$(echo -n "$PAYLOAD" | openssl dgst -sha256 -hmac "$SECRET" | awk '{print "sha256="$2}')
+          # Generate HMAC-SHA256 signature.
+          #
+          # The signature is generated from the exact payload
+          # that will be sent to the backend.
+          SIGNATURE=$(
+            printf '%s' "$PAYLOAD" |
+            openssl dgst -sha256 -hmac "$WEBHOOK_SECRET" |
+            awk '{print "sha256=" $2}'
+          )
 
-          # Send the webhook request
-          curl -X POST "${{ secrets.WEBHOOK_URL }}/api/webhooks/github" \
-            -H "Content-Type: application/json" \
-            -H "x-github-event: push" \
-            -H "x-hub-signature-256: $SIGNATURE" \
-            -d "$PAYLOAD"
+          echo "Sending webhook..."
 
-          echo "Webhook sent with signature: $SIGNATURE"
+          RESPONSE_FILE=$(mktemp)
+
+          HTTP_STATUS=$(
+            curl \
+              --silent \
+              --show-error \
+              --request POST \
+              --url "${WEBHOOK_URL}/api/webhooks/github" \
+              --header "Content-Type: application/json" \
+              --header "X-GitHub-Event: push" \
+              --header "X-Hub-Signature-256: ${SIGNATURE}" \
+              --data-raw "$PAYLOAD" \
+              --output "$RESPONSE_FILE" \
+              --write-out "%{http_code}"
+          )
+
+          echo "HTTP Status: $HTTP_STATUS"
+
+          echo "Webhook response:"
+          cat "$RESPONSE_FILE"
+
+          # Fail the workflow for any non-2xx response.
+          if [[ "$HTTP_STATUS" -lt 200 || "$HTTP_STATUS" -ge 300 ]]; then
+            echo "Webhook request failed."
+            exit 1
+          fi
+
+          echo "Documentation synchronization webhook sent successfully."
