@@ -16,28 +16,23 @@ jobs:
 
       - name: Send webhook to Customer Support Assistant
         run: |
-          # Get the changed files from the push event
-          ADDED_FILES=$(echo '${{ toJson(github.event.commits) }}' | jq -r '.[].added[]' | jq -Rs '.')
-          MODIFIED_FILES=$(echo '${{ toJson(github.event.commits) }}' | jq -r '.[].modified[]' | jq -Rs '.')
-          REMOVED_FILES=$(echo '${{ toJson(github.event.commits) }}' | jq -r '.[].removed[]' | jq -Rs '.')
+          # Get the changed files from the push event as JSON arrays
+          ADDED_FILES=$(echo '${{ toJson(github.event.commits) }}' | jq -r '[.[].added[] | select(. != null)]')
+          MODIFIED_FILES=$(echo '${{ toJson(github.event.commits) }}' | jq -r '[.[].modified[] | select(. != null)]')
+          REMOVED_FILES=$(echo '${{ toJson(github.event.commits) }}' | jq -r '[.[].removed[] | select(. != null)]')
 
           # Build the webhook payload
-          PAYLOAD=$(cat <<EOF
-          {
-            "ref": "${{ github.ref }}",
-            "repository": {
-              "full_name": "${{ github.repository }}"
-            },
-            "commits": [
-              {
-                "added": $ADDED_FILES,
-                "modified": $MODIFIED_FILES,
-                "removed": $REMOVED_FILES
-              }
-            ]
-          }
-          EOF
-          )
+          PAYLOAD=$(jq -n \
+            --arg ref "${{ github.ref }}" \
+            --arg repo "${{ github.repository }}" \
+            --argjson added "$ADDED_FILES" \
+            --argjson modified "$MODIFIED_FILES" \
+            --argjson removed "$REMOVED_FILES" \
+            '{
+              ref: $ref,
+              repository: { full_name: $repo },
+              commits: [{ added: $added, modified: $modified, removed: $removed }]
+            }')
 
           # Generate HMAC-SHA256 signature
           SECRET="${{ secrets.WEBHOOK_SECRET }}"
