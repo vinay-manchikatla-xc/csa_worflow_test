@@ -1,2 +1,2 @@
-# Old Name
-This file will be renamed.
+# New Name
+This file was renamed from old.md.
