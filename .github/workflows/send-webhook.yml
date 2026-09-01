@@ -16,20 +16,29 @@ jobs:
 
       - name: Send webhook to Customer Support Assistant
         run: |
-          # Build the webhook payload directly from GitHub context
+          # Get file changes from head_commit (has added/modified/removed arrays)
+          ADDED=$(echo '${{ toJson(github.event.head_commit.added) }}' | jq -r '. // []')
+          MODIFIED=$(echo '${{ toJson(github.event.head_commit.modified) }}' | jq -r '. // []')
+          REMOVED=$(echo '${{ toJson(github.event.head_commit.removed) }}' | jq -r '. // []')
+
+          # Build the webhook payload
           PAYLOAD=$(jq -n \
             --arg ref "${{ github.ref }}" \
             --arg repo "${{ github.repository }}" \
-            --argjson commits '${{ toJson(github.event.commits) }}' \
+            --argjson added "$ADDED" \
+            --argjson modified "$MODIFIED" \
+            --argjson removed "$REMOVED" \
             '{
               ref: $ref,
               repository: { full_name: $repo },
-              commits: [$commits[] | {
-                added: (.added // []),
-                modified: (.modified // []),
-                removed: (.removed // [])
+              commits: [{
+                added: $added,
+                modified: $modified,
+                removed: $removed
               }]
             }')
+
+          echo "Payload: $PAYLOAD"
 
           # Generate HMAC-SHA256 signature
           SECRET="${{ secrets.WEBHOOK_SECRET }}"
