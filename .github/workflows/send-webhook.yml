@@ -15,56 +15,47 @@ jobs:
       contents: read
 
     steps:
-      - name: Collect documentation changes
+      - name: Checkout repository
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Build documentation change payload
         id: changes
         env:
-          GH_TOKEN: ${{ github.token }}
-          REPOSITORY: ${{ github.repository }}
           BEFORE: ${{ github.event.before }}
           AFTER: ${{ github.event.after }}
+        shell: bash
         run: |
           set -euo pipefail
 
-          echo "Repository: $REPOSITORY"
           echo "Before: $BEFORE"
-          echo "After: $AFTER"
+          echo "After:  $AFTER"
 
-          echo "Getting changed files..."
-
-          # Get the files changed between the previous commit
-          # and the current commit.
+          # Get all files changed between the previous and current
+          # commit of main.
           #
-          # GitHub returns files with statuses such as:
-          # A = added
-          # M = modified
-          # D = removed
-          # R = renamed
-          FILES=$(gh api \
-            "repos/${REPOSITORY}/compare/${BEFORE}...${AFTER}" \
-            --paginate \
-            --jq '.files[] | [.status, .filename, (.previous_filename // "")] | @tsv')
+          # --name-status gives:
+          #
+          # A <file>   -> added
+          # M <file>   -> modified
+          # D <file>   -> deleted
+          #
+          # We restrict the diff to documentation/.
+          git diff --name-status "$BEFORE" "$AFTER" -- documentation/ > /tmp/documentation-changes.txt
 
-          echo "Changed files:"
-          echo "$FILES"
+          echo ""
+          echo "Documentation changes:"
+          cat /tmp/documentation-changes.txt || true
 
           ADDED='[]'
           MODIFIED='[]'
           REMOVED='[]'
 
-          while IFS=$'\t' read -r STATUS FILE PREVIOUS_FILE; do
-
-            # Ignore empty lines
-            if [[ -z "$FILE" ]]; then
-              continue
-            fi
-
-            # Only documentation files should be synchronized.
-            if [[ "$FILE" != documentation/* && "$PREVIOUS_FILE" != documentation/* ]]; then
-              continue
-            fi
+          while IFS=$'\t' read -r STATUS FILE EXTRA; do
+            [ -z "${FILE:-}" ] && continue
 
             case "$STATUS" in
-
               A)
                 ADDED=$(jq \
                   --arg file "$FILE" \
@@ -86,34 +77,30 @@ jobs:
                   <<< "$REMOVED")
                 ;;
 
-              R)
-                # For a rename:
+              R*)
+                # Rename:
+                # EXTRA = old path
+                # FILE  = new path
                 #
-                # old documentation file -> removed
-                # new documentation file -> added
-                #
-                if [[ "$PREVIOUS_FILE" == documentation/* ]]; then
+                # Treat it as delete + add.
+                if [ -n "${EXTRA:-}" ]; then
                   REMOVED=$(jq \
-                    --arg file "$PREVIOUS_FILE" \
+                    --arg file "$EXTRA" \
                     '. + [$file]' \
                     <<< "$REMOVED")
                 fi
 
-                if [[ "$FILE" == documentation/* ]]; then
-                  ADDED=$(jq \
-                    --arg file "$FILE" \
-                    '. + [$file]' \
-                    <<< "$ADDED")
-                fi
+                ADDED=$(jq \
+                  --arg file "$FILE" \
+                  '. + [$file]' \
+                  <<< "$ADDED")
                 ;;
 
               *)
                 echo "Ignoring unsupported status: $STATUS $FILE"
                 ;;
-
             esac
-
-          done <<< "$FILES"
+          done < /tmp/documentation-changes.txt
 
           COMMITS=$(jq -cn \
             --argjson added "$ADDED" \
@@ -127,12 +114,18 @@ jobs:
               }
             ]')
 
-          echo "Final changes:"
+          echo ""
+          echo "Generated change payload:"
           echo "$COMMITS" | jq .
 
-          echo "commits=$COMMITS" >> "$GITHUB_OUTPUT"
+          # Store multiline JSON safely as GitHub Actions output.
+          {
+            echo 'commits<<EOF'
+            echo "$COMMITS"
+            echo 'EOF'
+          } >> "$GITHUB_OUTPUT"
 
-      - name: Send documentation changes to Customer Support Assistant
+      - name: Send webhook
         env:
           WEBHOOK_URL: ${{ secrets.WEBHOOK_URL }}
           WEBHOOK_SECRET: ${{ secrets.WEBHOOK_SECRET }}
@@ -140,6 +133,7 @@ jobs:
           REF: ${{ github.ref }}
           AFTER: ${{ github.event.after }}
           COMMITS: ${{ steps.changes.outputs.commits }}
+        shell: bash
         run: |
           set -euo pipefail
 
@@ -158,22 +152,20 @@ jobs:
             }')
 
           echo "========================================"
-          echo "Webhook Payload"
+          echo "Webhook payload"
           echo "========================================"
 
           echo "$PAYLOAD" | jq .
 
-          echo "========================================"
-          echo "Generating HMAC signature"
-          echo "========================================"
-
+          # Generate HMAC-SHA256 from the exact bytes
+          # that will be sent to the backend.
           SIGNATURE=$(
             printf '%s' "$PAYLOAD" |
-            openssl dgst -sha256 -hmac "$WEBHOOK_SECRET" |
+            openssl dgst \
+              -sha256 \
+              -hmac "$WEBHOOK_SECRET" |
             awk '{print "sha256=" $2}'
           )
-
-          echo "Signature generated successfully."
 
           RESPONSE_FILE=$(mktemp)
 
@@ -191,14 +183,16 @@ jobs:
               --write-out "%{http_code}"
           )
 
-          echo "HTTP Status: $HTTP_STATUS"
+          echo ""
+          echo "HTTP status: $HTTP_STATUS"
 
           echo "Webhook response:"
           cat "$RESPONSE_FILE"
 
-          if [[ "$HTTP_STATUS" -lt 200 || "$HTTP_STATUS" -ge 300 ]]; then
+          if [ "$HTTP_STATUS" -lt 200 ] || [ "$HTTP_STATUS" -ge 300 ]; then
             echo "Webhook request failed."
             exit 1
           fi
 
+          echo ""
           echo "Documentation synchronization webhook sent successfully."
