@@ -44,7 +44,7 @@ jobs:
           SIGNATURE=$(echo -n "$PAYLOAD" | openssl dgst -sha256 -hmac "$SECRET" | awk '{print "sha256="$2}')
 
           # Send the webhook request
-          curl -X POST "${{ secrets.WEBHOOK_URL }}/webhooks/github" \
+          curl -X POST "${{ secrets.WEBHOOK_URL }}/api/webhooks/github" \
             -H "Content-Type: application/json" \
             -H "x-github-event: push" \
             -H "x-hub-signature-256: $SIGNATURE" \
